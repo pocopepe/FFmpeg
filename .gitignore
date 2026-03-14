@@ -50,3 +50,6 @@
 /libavfilter/vulkan/*.c
 /.*/
 !/.forgejo/
+build/
+ffmpeg_wasm.js
+ffmpeg_wasm.wasm

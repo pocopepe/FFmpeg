@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+    <head>
+        <title>WebGPU FFmpeg Test</title>
+    </head>
+    <body>
+        <h1>WebGPU hwcontext test</h1>
+        <pre id="log"></pre>
+
+        <script src="ffmpeg_wasm.js"></script>
+        <script>
+            const log = document.getElementById("log");
+            function print(msg) {
+                log.textContent += msg + "\n";
+            }
+
+            FFmpegWASM().then(async (m) => {
+                print(
+                    "FFmpeg version: " +
+                        m.ccall("get_ffmpeg_version", "string", [], []),
+                );
+                const ret = await m.ccall(
+                    "test_webgpu_device",
+                    "number",
+                    [],
+                    [],
+                    { async: true },
+                );
+                print(
+                    "test_webgpu_device returned: " +
+                        ret +
+                        (ret === 0 ? " (SUCCESS)" : " (FAILED)"),
+                );
+            });
+        </script>
+    </body>
+</html>

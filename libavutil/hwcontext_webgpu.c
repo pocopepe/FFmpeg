@@ -1,0 +1,297 @@
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#include <string.h>
+
+#include <emscripten.h>
+#include <webgpu/webgpu.h>
+
+#include "hwcontext.h"
+#include "hwcontext_internal.h"
+#include "hwcontext_webgpu.h"
+#include "mem.h"
+#include "log.h"
+#include "pixdesc.h"
+
+typedef struct WebGPUDevicePriv {
+    AVWebGPUDeviceContext p;
+    int async_done;
+} WebGPUDevicePriv;
+
+typedef struct WebGPUFramesPriv {
+    AVWebGPUFramesContext p;
+} WebGPUFramesPriv;
+
+typedef struct {
+    int done;
+    int error;
+} MapContext;
+
+static void on_adapter_ready(WGPURequestAdapterStatus status, WGPUAdapter adapter,
+                              WGPUStringView message, void *userdata1, void *userdata2)
+{
+    WebGPUDevicePriv *priv = userdata1;
+    if (status == WGPURequestAdapterStatus_Success)
+        priv->p.adapter = adapter;
+    priv->async_done = 1;
+}
+
+static void on_device_ready(WGPURequestDeviceStatus status, WGPUDevice device,
+                             WGPUStringView message, void *userdata1, void *userdata2)
+{
+    WebGPUDevicePriv *priv = userdata1;
+    if (status == WGPURequestDeviceStatus_Success) {
+        priv->p.device = device;
+        priv->p.queue  = wgpuDeviceGetQueue(device);
+    }
+    priv->async_done = 1;
+}
+
+static void on_buffer_mapped(WGPUMapAsyncStatus status, WGPUStringView message,
+                              void *userdata1, void *userdata2)
+{
+    MapContext *ctx = userdata1;
+    ctx->done  = 1;
+    if (status != WGPUMapAsyncStatus_Success)
+        ctx->error = 1;
+}
+
+static int webgpu_device_create(AVHWDeviceContext *ctx, const char *device,
+                                AVDictionary *opts, int flags)
+{
+    WebGPUDevicePriv *priv = ctx->hwctx;
+    WGPUInstanceDescriptor desc = { 0 };
+
+    priv->p.instance = wgpuCreateInstance(&desc);
+    if (!priv->p.instance) {
+        av_log(ctx, AV_LOG_ERROR, "Could not initialize WebGPU instance.\n");
+        return AVERROR_UNKNOWN;
+    }
+
+    WGPURequestAdapterOptions adapter_opts = { 0 };
+    WGPURequestAdapterCallbackInfo adapter_cb = {
+        .callback  = on_adapter_ready,
+        .mode      = WGPUCallbackMode_AllowSpontaneous,
+        .userdata1 = priv,
+    };
+
+    priv->async_done = 0;
+    wgpuInstanceRequestAdapter(priv->p.instance, &adapter_opts, adapter_cb);
+    while (!priv->async_done) emscripten_sleep(10);
+
+    if (!priv->p.adapter) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to get WebGPU adapter.\n");
+        return AVERROR_UNKNOWN;
+    }
+
+    WGPUDeviceDescriptor dev_desc = { 0 };
+    WGPURequestDeviceCallbackInfo device_cb = {
+        .callback  = on_device_ready,
+        .mode      = WGPUCallbackMode_AllowSpontaneous,
+        .userdata1 = priv,
+    };
+
+    priv->async_done = 0;
+    wgpuAdapterRequestDevice(priv->p.adapter, &dev_desc, device_cb);
+    while (!priv->async_done) emscripten_sleep(10);
+
+    if (!priv->p.device) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to get WebGPU device.\n");
+        return AVERROR_UNKNOWN;
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE, "WebGPU device created successfully.\n");
+    return 0;
+}
+
+static void webgpu_device_uninit(AVHWDeviceContext *ctx)
+{
+    WebGPUDevicePriv *priv = ctx->hwctx;
+    if (priv->p.queue)    wgpuQueueRelease(priv->p.queue);
+    if (priv->p.device)   wgpuDeviceRelease(priv->p.device);
+    if (priv->p.adapter)  wgpuAdapterRelease(priv->p.adapter);
+    if (priv->p.instance) wgpuInstanceRelease(priv->p.instance);
+}
+
+static int webgpu_frames_get_constraints(AVHWDeviceContext *ctx,
+                                         const void *hwconfig,
+                                         AVHWFramesConstraints *constraints)
+{
+    constraints->valid_sw_formats = av_malloc_array(2, sizeof(*constraints->valid_sw_formats));
+    if (!constraints->valid_sw_formats)
+        return AVERROR(ENOMEM);
+    constraints->valid_sw_formats[0] = AV_PIX_FMT_RGBA;
+    constraints->valid_sw_formats[1] = AV_PIX_FMT_NONE;
+
+    constraints->valid_hw_formats = av_malloc_array(2, sizeof(*constraints->valid_hw_formats));
+    if (!constraints->valid_hw_formats)
+        return AVERROR(ENOMEM);
+    constraints->valid_hw_formats[0] = AV_PIX_FMT_WEBGPU;
+    constraints->valid_hw_formats[1] = AV_PIX_FMT_NONE;
+
+    return 0;
+}
+
+static int webgpu_frames_init(AVHWFramesContext *hwfc)
+{
+    FFHWFramesContext *ctxi = (FFHWFramesContext *)hwfc;
+
+    if (hwfc->sw_format != AV_PIX_FMT_RGBA) {
+        av_log(hwfc, AV_LOG_ERROR, "Only AV_PIX_FMT_RGBA is supported as sw_format.\n");
+        return AVERROR(EINVAL);
+    }
+
+    ctxi->pool_internal = av_buffer_pool_init(sizeof(AVWebGPUFrame), av_buffer_alloc);
+    if (!ctxi->pool_internal)
+        return AVERROR(ENOMEM);
+
+    return 0;
+}
+
+static void webgpu_frame_free(void *opaque, uint8_t *data)
+{
+    AVWebGPUFrame *f = (AVWebGPUFrame *)data;
+    if (f->view)    wgpuTextureViewRelease(f->view);
+    if (f->texture) wgpuTextureRelease(f->texture);
+    av_free(f);
+}
+
+static int webgpu_get_buffer(AVHWFramesContext *hwfc, AVFrame *frame)
+{
+    WebGPUDevicePriv *priv = hwfc->device_ctx->hwctx;
+
+    AVWebGPUFrame *f = av_mallocz(sizeof(AVWebGPUFrame));
+    if (!f)
+        return AVERROR(ENOMEM);
+
+    WGPUTextureDescriptor tex_desc = {
+        .usage         = WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc |
+                         WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding,
+        .dimension     = WGPUTextureDimension_2D,
+        .size          = (WGPUExtent3D){ hwfc->width, hwfc->height, 1 },
+        .format        = WGPUTextureFormat_RGBA8Unorm,
+        .mipLevelCount = 1,
+        .sampleCount   = 1,
+    };
+
+    f->texture = wgpuDeviceCreateTexture(priv->p.device, &tex_desc);
+    f->view    = wgpuTextureCreateView(f->texture, NULL);
+
+    frame->data[0] = (uint8_t *)f;
+    frame->format  = AV_PIX_FMT_WEBGPU;
+    frame->width   = hwfc->width;
+    frame->height  = hwfc->height;
+    frame->buf[0]  = av_buffer_create((uint8_t *)f, sizeof(AVWebGPUFrame),
+                                      webgpu_frame_free, hwfc, 0);
+    return 0;
+}
+
+static int webgpu_transfer_data_to(AVHWFramesContext *hwfc, AVFrame *dst, const AVFrame *src)
+{
+    WebGPUDevicePriv *priv = hwfc->device_ctx->hwctx;
+    AVWebGPUFrame *dst_f   = (AVWebGPUFrame *)dst->data[0];
+
+    WGPUTexelCopyTextureInfo copy_dest = { .texture = dst_f->texture };
+    WGPUTexelCopyBufferLayout layout = {
+        .bytesPerRow  = src->linesize[0],
+        .rowsPerImage = src->height,
+    };
+    WGPUExtent3D write_size = { src->width, src->height, 1 };
+
+    wgpuQueueWriteTexture(priv->p.queue, &copy_dest, src->data[0],
+                          src->linesize[0] * src->height, &layout, &write_size);
+    return 0;
+}
+
+static int webgpu_transfer_data_from(AVHWFramesContext *hwfc, AVFrame *dst, const AVFrame *src)
+{
+    WebGPUDevicePriv *priv = hwfc->device_ctx->hwctx;
+    AVWebGPUFrame *src_f   = (AVWebGPUFrame *)src->data[0];
+
+    uint32_t padded_bytes_per_row = (dst->width * 4 + 255) & ~255;
+    uint64_t buf_size = (uint64_t)padded_bytes_per_row * dst->height;
+
+    WGPUBufferDescriptor buf_desc = {
+        .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+        .size  = buf_size,
+    };
+    WGPUBuffer staging_buffer = wgpuDeviceCreateBuffer(priv->p.device, &buf_desc);
+
+    WGPUCommandEncoderDescriptor enc_desc = { 0 };
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(priv->p.device, &enc_desc);
+
+    WGPUTexelCopyTextureInfo copy_src = { .texture = src_f->texture };
+    WGPUTexelCopyBufferInfo copy_buf = {
+        .buffer              = staging_buffer,
+        .layout.bytesPerRow  = padded_bytes_per_row,
+        .layout.rowsPerImage = dst->height,
+    };
+    WGPUExtent3D copy_size = { dst->width, dst->height, 1 };
+
+    wgpuCommandEncoderCopyTextureToBuffer(encoder, &copy_src, &copy_buf, &copy_size);
+
+    WGPUCommandBufferDescriptor cmd_desc = { 0 };
+    WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
+    wgpuQueueSubmit(priv->p.queue, 1, &commands);
+    wgpuCommandBufferRelease(commands);
+    wgpuCommandEncoderRelease(encoder);
+
+    MapContext map_ctx = { .done = 0, .error = 0 };
+    WGPUBufferMapCallbackInfo cb_info = {
+        .callback  = on_buffer_mapped,
+        .mode      = WGPUCallbackMode_AllowSpontaneous,
+        .userdata1 = &map_ctx,
+    };
+
+    wgpuBufferMapAsync(staging_buffer, WGPUMapMode_Read, 0, buf_size, cb_info);
+    while (!map_ctx.done) emscripten_sleep(10);
+
+    if (map_ctx.error) {
+        wgpuBufferRelease(staging_buffer);
+        return AVERROR_EXTERNAL;
+    }
+
+    const uint8_t *mapped = wgpuBufferGetConstMappedRange(staging_buffer, 0, buf_size);
+    for (int y = 0; y < dst->height; y++) {
+        memcpy(dst->data[0] + y * dst->linesize[0],
+               mapped       + y * padded_bytes_per_row,
+               dst->width * 4);
+    }
+
+    wgpuBufferUnmap(staging_buffer);
+    wgpuBufferRelease(staging_buffer);
+    return 0;
+}
+
+const HWContextType ff_hwcontext_type_webgpu = {
+    .type                   = AV_HWDEVICE_TYPE_WEBGPU,
+    .name                   = "WebGPU",
+    .device_hwctx_size      = sizeof(WebGPUDevicePriv),
+    .frames_hwctx_size      = sizeof(WebGPUFramesPriv),
+    .device_create          = webgpu_device_create,
+    .device_uninit          = webgpu_device_uninit,
+    .frames_get_constraints = webgpu_frames_get_constraints,
+    .frames_init            = webgpu_frames_init,
+    .frames_get_buffer      = webgpu_get_buffer,
+    .transfer_data_to       = webgpu_transfer_data_to,
+    .transfer_data_from     = webgpu_transfer_data_from,
+    .pix_fmts               = (const enum AVPixelFormat[]) {
+        AV_PIX_FMT_WEBGPU,
+        AV_PIX_FMT_NONE
+    },
+};

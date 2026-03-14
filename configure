@@ -372,6 +372,7 @@ External library support:
   --disable-vdpau          disable Nvidia Video Decode and Presentation API for Unix code [autodetect]
   --disable-videotoolbox   disable VideoToolbox code [autodetect]
   --disable-vulkan         disable Vulkan code [autodetect]
+  --disable-webgpu         disable WebGPU code [autodetect]
   --enable-vulkan-static   statically link to libvulkan [no]
 
 Toolchain options:
@@ -2142,6 +2143,7 @@ HWACCEL_AUTODETECT_LIBRARY_LIST="
     vdpau
     videotoolbox
     vulkan
+    webgpu
     v4l2_m2m
 "
 
@@ -7743,6 +7745,8 @@ enabled vdpau &&
 
 enabled vdpau &&
     check_lib vdpau_x11 "vdpau/vdpau.h vdpau/vdpau_x11.h" vdp_device_create_x11 -lvdpau -lX11
+
+enabled webgpu && check_headers webgpu/webgpu.h
 
 # Check for the Vulkan headers
 if enabled_all vulkan vulkan_static; then
