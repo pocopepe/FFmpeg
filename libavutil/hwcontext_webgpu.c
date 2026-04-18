@@ -18,7 +18,10 @@
 
 #include <string.h>
 
+#ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#endif
+
 #include <webgpu/webgpu.h>
 
 #include "hwcontext.h"
@@ -45,6 +48,20 @@ typedef struct {
     int done;
     int error;
 } MapContext;
+
+/* Yield until a WebGPU callback sets *flag.  Emscripten requires
+ * emscripten_sleep() to hand control back to the JS event loop;
+ * native builds use wgpuInstanceProcessEvents() instead. */
+static av_always_inline void webgpu_await(WGPUInstance instance, volatile int *flag)
+{
+#ifdef __EMSCRIPTEN__
+    while (!*flag)
+        emscripten_sleep(1);
+#else
+    while (!*flag)
+        wgpuInstanceProcessEvents(instance);
+#endif
+}
 
 static void on_adapter_ready(WGPURequestAdapterStatus status, WGPUAdapter adapter,
                               WGPUStringView message, void *userdata1, void *userdata2)
@@ -96,7 +113,7 @@ static int webgpu_device_create(AVHWDeviceContext *ctx, const char *device,
 
     priv->async_done = 0;
     wgpuInstanceRequestAdapter(priv->p.instance, &adapter_opts, adapter_cb);
-    while (!priv->async_done) emscripten_sleep(10);
+    webgpu_await(priv->p.instance, &priv->async_done);
 
     if (!priv->p.adapter) {
         av_log(ctx, AV_LOG_ERROR, "Failed to get WebGPU adapter.\n");
@@ -112,7 +129,7 @@ static int webgpu_device_create(AVHWDeviceContext *ctx, const char *device,
 
     priv->async_done = 0;
     wgpuAdapterRequestDevice(priv->p.adapter, &dev_desc, device_cb);
-    while (!priv->async_done) emscripten_sleep(10);
+    webgpu_await(priv->p.instance, &priv->async_done);
 
     if (!priv->p.device) {
         av_log(ctx, AV_LOG_ERROR, "Failed to get WebGPU device.\n");
@@ -284,7 +301,7 @@ static int webgpu_transfer_data_from(AVHWFramesContext *hwfc, AVFrame *dst, cons
     };
 
     wgpuBufferMapAsync(staging_buffer, WGPUMapMode_Read, 0, buf_size, cb_info);
-    while (!map_ctx.done) emscripten_sleep(10);
+    webgpu_await(priv->p.instance, &map_ctx.done);
 
     if (map_ctx.error) {
         wgpuBufferRelease(staging_buffer);
