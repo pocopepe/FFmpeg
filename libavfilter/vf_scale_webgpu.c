@@ -20,6 +20,7 @@
 
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_webgpu.h"
+#include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "filters.h"
 #include "scale_eval.h"
@@ -163,7 +164,7 @@ static int scale_webgpu_filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext      *avctx  = inlink->dst;
     ScaleWebGPUContext   *s      = avctx->priv;
     AVFilterLink         *outlink = avctx->outputs[0];
-    AVHWFramesContext    *in_hwfc = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
+    AVHWFramesContext    *in_hwfc = (AVHWFramesContext *)ff_filter_link(inlink)->hw_frames_ctx->data;
     AVWebGPUDeviceContext *wgpu   = in_hwfc->device_ctx->hwctx;
     AVWebGPUFrame        *in_f   = (AVWebGPUFrame *)in->data[0];
     int ret;

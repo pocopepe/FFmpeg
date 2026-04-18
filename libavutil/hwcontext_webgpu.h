@@ -35,7 +35,7 @@ typedef struct AVWebGPUDeviceContext {
  * (CopyDst|CopySrc|StorageBinding|TextureBinding) and RGBA8Unorm respectively.
  */
 typedef struct AVWebGPUFramesContext {
-    WGPUTextureUsageFlags usage;
+    WGPUTextureUsage usage;
     WGPUTextureFormat     format;
 } AVWebGPUFramesContext;
 
