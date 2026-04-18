@@ -20,7 +20,6 @@
 
 /**
  * Main WebGPU context, allocated as AVHWDeviceContext.hwctx.
- * This holds the persistent connection to the browser's GPU.
  */
 typedef struct AVWebGPUDeviceContext {
     WGPUInstance instance;
@@ -31,32 +30,21 @@ typedef struct AVWebGPUDeviceContext {
 
 /**
  * Allocated as AVHWFramesContext.hwctx.
- * Defines the properties of the textures being created.
+ *
+ * usage and format are optional; zero values fall back to
+ * (CopyDst|CopySrc|StorageBinding|TextureBinding) and RGBA8Unorm respectively.
  */
 typedef struct AVWebGPUFramesContext {
-    WGPUTextureUsage usage;
-    WGPUTextureFormat format;
+    WGPUTextureUsageFlags usage;
+    WGPUTextureFormat     format;
 } AVWebGPUFramesContext;
 
 /**
- * The actual hardware frame structure.
- * When a video frame is on the GPU, AVFrame->data[0] will point to this struct.
+ * Hardware frame. AVFrame->data[0] points to this when format is AV_PIX_FMT_WEBGPU.
  */
 typedef struct AVWebGPUFrame {
-    /**
-     * The WebGPU texture containing the image data.
-     */
-    WGPUTexture texture;
-
-    /**
-     * The default view of the texture (used for shaders).
-     */
+    WGPUTexture     texture;
     WGPUTextureView view;
 } AVWebGPUFrame;
-
-/**
- * Helper to allocate a WebGPU frame struct.
- */
-AVWebGPUFrame *av_webgpu_frame_alloc(void);
 
 #endif /* AVUTIL_HWCONTEXT_WEBGPU_H */

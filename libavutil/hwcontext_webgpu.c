@@ -28,6 +28,10 @@
 #include "log.h"
 #include "pixdesc.h"
 
+#define DEFAULT_TEXTURE_USAGE \
+    (WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc | \
+     WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding)
+
 typedef struct WebGPUDevicePriv {
     AVWebGPUDeviceContext p;
     int async_done;
@@ -149,16 +153,17 @@ static int webgpu_frames_get_constraints(AVHWDeviceContext *ctx,
 
 static int webgpu_frames_init(AVHWFramesContext *hwfc)
 {
-    FFHWFramesContext *ctxi = (FFHWFramesContext *)hwfc;
+    WebGPUFramesPriv *fpriv = hwfc->hwctx;
 
     if (hwfc->sw_format != AV_PIX_FMT_RGBA) {
         av_log(hwfc, AV_LOG_ERROR, "Only AV_PIX_FMT_RGBA is supported as sw_format.\n");
         return AVERROR(EINVAL);
     }
 
-    ctxi->pool_internal = av_buffer_pool_init(sizeof(AVWebGPUFrame), av_buffer_alloc);
-    if (!ctxi->pool_internal)
-        return AVERROR(ENOMEM);
+    if (!fpriv->p.usage)
+        fpriv->p.usage = DEFAULT_TEXTURE_USAGE;
+    if (!fpriv->p.format)
+        fpriv->p.format = WGPUTextureFormat_RGBA8Unorm;
 
     return 0;
 }
@@ -173,24 +178,28 @@ static void webgpu_frame_free(void *opaque, uint8_t *data)
 
 static int webgpu_get_buffer(AVHWFramesContext *hwfc, AVFrame *frame)
 {
-    WebGPUDevicePriv *priv = hwfc->device_ctx->hwctx;
+    WebGPUDevicePriv  *priv  = hwfc->device_ctx->hwctx;
+    WebGPUFramesPriv  *fpriv = hwfc->hwctx;
 
     AVWebGPUFrame *f = av_mallocz(sizeof(AVWebGPUFrame));
     if (!f)
         return AVERROR(ENOMEM);
 
     WGPUTextureDescriptor tex_desc = {
-        .usage         = WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc |
-                         WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding,
+        .usage         = fpriv->p.usage,
         .dimension     = WGPUTextureDimension_2D,
         .size          = (WGPUExtent3D){ hwfc->width, hwfc->height, 1 },
-        .format        = WGPUTextureFormat_RGBA8Unorm,
+        .format        = fpriv->p.format,
         .mipLevelCount = 1,
         .sampleCount   = 1,
     };
 
     f->texture = wgpuDeviceCreateTexture(priv->p.device, &tex_desc);
-    f->view    = wgpuTextureCreateView(f->texture, NULL);
+    if (!f->texture) {
+        av_free(f);
+        return AVERROR_EXTERNAL;
+    }
+    f->view = wgpuTextureCreateView(f->texture, NULL);
 
     frame->data[0] = (uint8_t *)f;
     frame->format  = AV_PIX_FMT_WEBGPU;
@@ -198,6 +207,10 @@ static int webgpu_get_buffer(AVHWFramesContext *hwfc, AVFrame *frame)
     frame->height  = hwfc->height;
     frame->buf[0]  = av_buffer_create((uint8_t *)f, sizeof(AVWebGPUFrame),
                                       webgpu_frame_free, hwfc, 0);
+    if (!frame->buf[0]) {
+        webgpu_frame_free(hwfc, (uint8_t *)f);
+        return AVERROR(ENOMEM);
+    }
     return 0;
 }
 
@@ -205,6 +218,11 @@ static int webgpu_transfer_data_to(AVHWFramesContext *hwfc, AVFrame *dst, const 
 {
     WebGPUDevicePriv *priv = hwfc->device_ctx->hwctx;
     AVWebGPUFrame *dst_f   = (AVWebGPUFrame *)dst->data[0];
+
+    if (src->format != AV_PIX_FMT_RGBA) {
+        av_log(hwfc, AV_LOG_ERROR, "Only AV_PIX_FMT_RGBA source is supported.\n");
+        return AVERROR(EINVAL);
+    }
 
     WGPUTexelCopyTextureInfo copy_dest = { .texture = dst_f->texture };
     WGPUTexelCopyBufferLayout layout = {
@@ -223,6 +241,11 @@ static int webgpu_transfer_data_from(AVHWFramesContext *hwfc, AVFrame *dst, cons
     WebGPUDevicePriv *priv = hwfc->device_ctx->hwctx;
     AVWebGPUFrame *src_f   = (AVWebGPUFrame *)src->data[0];
 
+    if (dst->format != AV_PIX_FMT_RGBA) {
+        av_log(hwfc, AV_LOG_ERROR, "Only AV_PIX_FMT_RGBA destination is supported.\n");
+        return AVERROR(EINVAL);
+    }
+
     uint32_t padded_bytes_per_row = (dst->width * 4 + 255) & ~255;
     uint64_t buf_size = (uint64_t)padded_bytes_per_row * dst->height;
 
@@ -231,6 +254,8 @@ static int webgpu_transfer_data_from(AVHWFramesContext *hwfc, AVFrame *dst, cons
         .size  = buf_size,
     };
     WGPUBuffer staging_buffer = wgpuDeviceCreateBuffer(priv->p.device, &buf_desc);
+    if (!staging_buffer)
+        return AVERROR_EXTERNAL;
 
     WGPUCommandEncoderDescriptor enc_desc = { 0 };
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(priv->p.device, &enc_desc);
