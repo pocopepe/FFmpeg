@@ -19,3 +19,30 @@ $(APITESTPROGS): %$(EXESUF): %.o $(FF_DEP_LIBS)
 
 testclean::
 	$(RM) $(addprefix $(APITESTSDIR)/,$(CLEANSUFFIXES) *-test$(EXESUF))
+
+# WebGPU tests — built with Emscripten separately from the native toolchain.
+# Run: make fate-webgpu-build   (requires emcc + emdawnwebgpu port)
+WEBGPU_TEST_SRC  = $(SRC_PATH)/tests/api/api-webgpu-test.c
+WEBGPU_TEST_OUT  = $(APITESTSDIR)/api-webgpu-test.js
+WEBGPU_BUILD_DIR = $(SRC_PATH)/build
+
+fate-webgpu-build: $(WEBGPU_TEST_OUT)
+
+$(WEBGPU_TEST_OUT): $(WEBGPU_TEST_SRC)
+	emcc $< \
+	    -I$(SRC_PATH) \
+	    -I$(WEBGPU_BUILD_DIR)/include \
+	    -L$(WEBGPU_BUILD_DIR)/lib \
+	    -lavfilter -lavcodec -lavformat -lavutil -lswscale -lswresample \
+	    --use-port=emdawnwebgpu \
+	    -s ASYNCIFY \
+	    -s MODULARIZE=1 \
+	    -s EXPORT_NAME="FFmpegWebGPUTest" \
+	    -s EXPORTED_RUNTIME_METHODS='["ccall"]' \
+	    -s INITIAL_MEMORY=67108864 \
+	    -s ALLOW_MEMORY_GROWTH=1 \
+	    -O2 \
+	    -o $@
+
+testclean::
+	$(RM) $(APITESTSDIR)/api-webgpu-test.js $(APITESTSDIR)/api-webgpu-test.wasm
