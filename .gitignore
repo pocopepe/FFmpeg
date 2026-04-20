@@ -53,3 +53,8 @@
 build/
 ffmpeg_wasm.js
 ffmpeg_wasm.wasm
+tests/webgpu/node_modules/
+tests/webgpu/results/*.json
+wasm/build-cpu/
+wasm/build-webgpu/
+wasm/tests/samples/

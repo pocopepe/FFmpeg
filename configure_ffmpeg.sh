@@ -27,6 +27,10 @@ FFMPEG_FLAGS+=(
     --enable-swscale
     --enable-swresample
 
+    --enable-filter=buffer
+    --enable-filter=buffersink
+    --enable-filter=scale_webgpu
+
     --enable-decoder=h264
     --enable-decoder=aac
     --enable-decoder=mp3
@@ -37,6 +41,7 @@ FFMPEG_FLAGS+=(
     --enable-parser=aac
 
     --enable-webgpu
+    --enable-filter=scale_webgpu
 )
 
 emconfigure ./configure \
@@ -50,4 +55,4 @@ emconfigure ./configure \
     --enable-static \
     --extra-cflags="-O3 --use-port=emdawnwebgpu" \
     --extra-cxxflags="-O3" \
-    --extra-ldflags="-O3 --use-port=emdawnwebgpu -s INITIAL_MEMORY=33554432"
+    --extra-ldflags="-O3 --use-port=emdawnwebgpu -s ASYNCIFY -s INITIAL_MEMORY=33554432"
