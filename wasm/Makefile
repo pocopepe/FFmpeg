@@ -5,8 +5,9 @@ WEBGPU_BUILD := build-webgpu
 
 NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
 
-CPU_EXPORTS    := _malloc,_free,_pipeline_version,_pipeline_run_rgba,_bench_scale_cpu
-WEBGPU_EXPORTS := _malloc,_free,_pipeline_version,_pipeline_run_rgba,_pipeline_run_rgba_gpu,_bench_scale_cpu,_bench_scale_webgpu
+DECODER_EXPORTS := _decoder_open,_decoder_width,_decoder_height,_decoder_fps_num,_decoder_fps_den,_decoder_next_frame,_decoder_close
+CPU_EXPORTS    := _malloc,_free,_pipeline_version,_pipeline_run_rgba,_bench_scale_cpu,$(DECODER_EXPORTS)
+WEBGPU_EXPORTS := _malloc,_free,_pipeline_version,_pipeline_run_rgba,_pipeline_run_rgba_gpu,_bench_scale_cpu,_bench_scale_webgpu,$(DECODER_EXPORTS)
 
 .PHONY: all cpu webgpu configure-cpu configure-webgpu clean size test test-fate bench
 

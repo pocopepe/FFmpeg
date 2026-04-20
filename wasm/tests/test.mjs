@@ -100,6 +100,37 @@ async function testBuild(name, jsPath) {
         mod._free(srcPtr); mod._free(dstPtr);
     }
 
+    // decoder test (uses samples downloaded by fate.mjs — skip if absent)
+    {
+        const samplePath = path.join(__dirname, 'samples/h264-small.mp4');
+        if (fs.existsSync(samplePath)) {
+            const fileBytes = fs.readFileSync(samplePath);
+            const srcPtr = allocU8(fileBytes);
+            const handle = mod.ccall('decoder_open', 'number',
+                ['number','number'], [srcPtr, fileBytes.byteLength]);
+            mod._free(srcPtr);
+            ok(`decoder_open returns handle >= 0`, handle >= 0);
+            if (handle >= 0) {
+                const w = mod.ccall('decoder_width',  'number', ['number'], [handle]);
+                const h = mod.ccall('decoder_height', 'number', ['number'], [handle]);
+                ok(`decoder dimensions > 0`, w > 0 && h > 0);
+                console.log(`        video: ${w}x${h}`);
+                const dstPtr = mod._malloc(w * h * 4);
+                const ret = mod.ccall('decoder_next_frame', 'number',
+                    ['number','number','number','number'], [handle, dstPtr, w, h]);
+                ok(`decoder_next_frame first frame`, ret === 0);
+                if (ret === 0) {
+                    const out = new Uint8Array(mod.HEAPU8.buffer, dstPtr, w * h * 4);
+                    ok(`first frame non-zero`, out.some(v => v !== 0));
+                }
+                mod._free(dstPtr);
+                mod.ccall('decoder_close', null, ['number'], [handle]);
+            }
+        } else {
+            skip(`decoder test`, 'no sample — run make test-fate first to download');
+        }
+    }
+
     // CPU bench
     {
         const ms = mod.ccall('bench_scale_cpu', 'number',
