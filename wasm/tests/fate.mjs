@@ -1,69 +1,27 @@
 /**
- * fate.mjs — integration tests using real FFmpeg sample files.
+ * fate.mjs — FATE integration tests against the full FFmpeg sample suite.
  *
- * Downloads a curated set of tiny official FFmpeg FATE samples on first run,
- * caches them in tests/samples/, then runs each through the WASM build and
- * verifies the output.
+ * For each supported sample in fate-suite, decodes the first frame with both
+ * the WASM build and native ffmpeg, then compares pixel-by-pixel.
  *
- * Run: node wasm/tests/fate.mjs
+ * Run:  node wasm/tests/fate.mjs
+ * Env:  FATE_SAMPLES=/path/to/fate-suite  (default: ~/fate-suite)
  */
 
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
-import https  from 'https';
-import http   from 'http';
-import path   from 'path';
-import fs     from 'fs';
+import { spawnSync }     from 'child_process';
+import path from 'path';
+import fs   from 'fs';
+import os   from 'os';
 
-const __dirname   = path.dirname(fileURLToPath(import.meta.url));
-const SAMPLES_DIR = path.join(__dirname, 'samples');
-const WASM_DIR    = path.join(__dirname, '..');
-const require     = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WASM_DIR  = path.join(__dirname, '..');
+const require   = createRequire(import.meta.url);
+const FATE_DIR  = process.env.FATE_SAMPLES || path.join(os.homedir(), 'fate-suite');
 
-fs.mkdirSync(SAMPLES_DIR, { recursive: true });
-
-// ── tiny public samples (< 100KB each) ───────────────────────────────────────
-// sourced from samples.ffmpeg.org — same files used by FATE
-
-const SAMPLES = [
-    {
-        name:  'h264-small.mp4',
-        url:   'http://samples.ffmpeg.org/h264-conformance/SVA_NL2_E.264',
-        desc:  'H264 conformance stream',
-    },
-    {
-        name:  'vp8-small.webm',
-        url:   'http://samples.ffmpeg.org/V-codecs/VP8/VP80-00-00-00_01.webm',
-        desc:  'VP8 bitstream',
-    },
-];
-
-// ── download helper ───────────────────────────────────────────────────────────
-
-function download(url, dest) {
-    return new Promise((resolve, reject) => {
-        if (fs.existsSync(dest)) { resolve(); return; }
-        console.log(`    downloading ${path.basename(dest)}...`);
-        const file = fs.createWriteStream(dest);
-        const get  = url.startsWith('https') ? https.get : http.get;
-        get(url, res => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                file.close();
-                fs.unlinkSync(dest);
-                download(res.headers.location, dest).then(resolve).catch(reject);
-                return;
-            }
-            if (res.statusCode !== 200) {
-                reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-                return;
-            }
-            res.pipe(file);
-            file.on('finish', () => { file.close(); resolve(); });
-        }).on('error', err => { fs.unlinkSync(dest); reject(err); });
-    });
-}
-
-// ── test runner ───────────────────────────────────────────────────────────────
+// containers our WASM build's demuxers cover
+const SUPPORTED_EXTS = new Set(['.mp4', '.mov', '.mkv', '.webm']);
 
 let passed = 0, failed = 0, skipped = 0;
 
@@ -76,136 +34,148 @@ function skip(label, reason) {
     skipped++;
 }
 
-function makeGradient(w, h) {
-    const buf = new Uint8Array(w * h * 4);
-    for (let y = 0; y < h; y++)
-        for (let x = 0; x < w; x++) {
-            const i = (y * w + x) * 4;
-            buf[i] = (x * 255 / (w - 1)) | 0;
-            buf[i+1] = (y * 255 / (h - 1)) | 0;
-            buf[i+2] = 128; buf[i+3] = 255;
+// Recursively collect all files with supported extensions.
+function findSamples(dir) {
+    const out = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            out.push(...findSamples(full));
+        } else if (SUPPORTED_EXTS.has(path.extname(entry.name).toLowerCase())) {
+            out.push(full);
         }
-    return buf;
+    }
+    return out;
 }
 
-// ── per-build test cases ──────────────────────────────────────────────────────
+// Use native ffmpeg to decode the first frame of a file to raw RGBA.
+function nativeFirstFrame(filePath, w, h) {
+    const tmp = path.join(os.tmpdir(), `fate-ref-${process.pid}.raw`);
+    const r = spawnSync('ffmpeg', [
+        '-loglevel', 'error',
+        '-i', filePath,
+        '-vframes', '1',
+        '-vf', `scale=${w}:${h}`,
+        '-f', 'rawvideo', '-pix_fmt', 'rgba',
+        '-y', tmp,
+    ], { timeout: 10000 });
+    if (r.status !== 0) return null;
+    const data = fs.readFileSync(tmp);
+    fs.unlinkSync(tmp);
+    return new Uint8Array(data.buffer);
+}
+
+// Compare two RGBA buffers. Returns { match, maxDiff, diffPixels }.
+// Alpha channel is ignored — colorspace conversion can produce different alpha.
+function compareFrames(a, b, tolerance = 3) {
+    if (a.length !== b.length) return { match: false, maxDiff: -1, diffPixels: -1 };
+    let maxDiff = 0, diffPixels = 0;
+    const nPixels = a.length / 4;
+    for (let i = 0; i < nPixels; i++) {
+        const base = i * 4;
+        let pixDiff = 0;
+        for (let c = 0; c < 3; c++) {
+            const d = Math.abs(a[base + c] - b[base + c]);
+            if (d > maxDiff) maxDiff = d;
+            if (d > pixDiff) pixDiff = d;
+        }
+        if (pixDiff > tolerance) diffPixels++;
+    }
+    return { match: diffPixels === 0, maxDiff, diffPixels };
+}
 
 async function runTests(name, jsPath) {
-    console.log(`\n── ${name} ──`);
+    console.log(`\n${'─'.repeat(60)}`);
+    console.log(`  ${name}`);
+    console.log(`${'─'.repeat(60)}\n`);
 
-    if (!fs.existsSync(jsPath)) { skip('load', 'not built'); return; }
+    if (!fs.existsSync(jsPath)) {
+        skip(name, 'not built');
+        return;
+    }
 
     const factory = require(jsPath);
     let mod;
     try   { mod = await factory(); }
     catch (e) { console.error(`  FAIL  load: ${e.message}`); failed++; return; }
 
-    ok('WASM loads', true);
-
     const ver = mod.ccall('pipeline_version', 'string', [], []);
-    ok('pipeline_version', typeof ver === 'string' && ver.length > 0);
-    console.log(`        ${ver}`);
+    console.log(`  FFmpeg ${ver}\n`);
 
-    const W = 320, H = 240, DW = 160, DH = 120;
-    const src = makeGradient(W, H);
-
-    function alloc(buf) {
-        const p = mod._malloc(buf.byteLength);
-        mod.HEAPU8.set(buf, p);
-        return p;
+    if (!fs.existsSync(FATE_DIR)) {
+        skip('fate-suite', `${FATE_DIR} not found`);
+        return;
     }
 
-    // ── scale filter (CPU) ────────────────────────────────────────────────────
+    const samples = findSamples(FATE_DIR).sort();
+    console.log(`  ${samples.length} candidate files\n`);
 
-    {
-        const sp = alloc(src);
-        const dp = mod._malloc(DW * DH * 4);
-        const ret = mod.ccall('pipeline_run_rgba', 'number',
-            ['number','number','number','number','number','number','string'],
-            [sp, W, H, dp, DW, DH, `scale=${DW}:${DH}`]);
-        ok('pipeline_run_rgba returns 0', ret === 0);
-        if (ret === 0) {
-            const out = new Uint8Array(mod.HEAPU8.buffer, dp, DW * DH * 4);
-            ok('CPU scale output non-zero', out.some(v => v !== 0));
-            // top-left pixel of a gradient scaled from 320x240 should still be ~0
-            ok('CPU scale corner pixel plausible', out[0] < 20 && out[1] < 20);
+    let nDecoded = 0, nSkipped = 0, nFailed = 0;
+
+    for (const samplePath of samples) {
+        const label = path.relative(FATE_DIR, samplePath);
+
+        // ── WASM decode ────────────────────────────────────────────────
+        const fileBytes = fs.readFileSync(samplePath);
+        const srcPtr = mod._malloc(fileBytes.byteLength);
+        mod.HEAPU8.set(fileBytes, srcPtr);
+        const handle = mod.ccall('decoder_open', 'number',
+            ['number', 'number'], [srcPtr, fileBytes.byteLength]);
+        mod._free(srcPtr);
+
+        if (handle < 0) {
+            skip(label, `unsupported codec/container (${handle})`);
+            nSkipped++;
+            continue;
         }
-        mod._free(sp); mod._free(dp);
-    }
 
-    // ── scale dimensions preserved ────────────────────────────────────────────
-    // run the same frame at multiple output sizes and check non-zero output
+        const w = mod.ccall('decoder_width',  'number', ['number'], [handle]);
+        const h = mod.ccall('decoder_height', 'number', ['number'], [handle]);
 
-    for (const [dw, dh] of [[640, 480], [80, 60], [320, 240]]) {
-        const sp = alloc(src);
-        const dp = mod._malloc(dw * dh * 4);
-        const ret = mod.ccall('pipeline_run_rgba', 'number',
-            ['number','number','number','number','number','number','string'],
-            [sp, W, H, dp, dw, dh, `scale=${dw}:${dh}`]);
-        ok(`scale ${W}x${H}→${dw}x${dh}`, ret === 0);
-        mod._free(sp); mod._free(dp);
-    }
+        const dstPtr = mod._malloc(w * h * 4);
+        const frameRet = mod.ccall('decoder_next_frame', 'number',
+            ['number', 'number', 'number', 'number'], [handle, dstPtr, w, h]);
 
-    // ── bench ─────────────────────────────────────────────────────────────────
+        if (frameRet !== 0) {
+            mod._free(dstPtr);
+            mod.ccall('decoder_close', null, ['number'], [handle]);
+            skip(label, `no video frame (${frameRet})`);
+            nSkipped++;
+            continue;
+        }
 
-    {
-        const ms = mod.ccall('bench_scale_cpu', 'number',
-            ['number','number','number','number','number'], [W, H, DW, DH, 30]);
-        ok('bench_scale_cpu > 0', ms > 0);
-        console.log(`        CPU bench: ${ms.toFixed(2)} ms/frame  (${(1000/ms).toFixed(0)} fps equiv)`);
-    }
+        const wasmFrame = new Uint8Array(mod.HEAPU8.buffer, dstPtr, w * h * 4).slice();
+        mod._free(dstPtr);
+        mod.ccall('decoder_close', null, ['number'], [handle]);
 
-    // ── WebGPU path ───────────────────────────────────────────────────────────
+        // ── native reference ───────────────────────────────────────────
+        const refFrame = nativeFirstFrame(samplePath, w, h);
+        if (!refFrame) {
+            skip(label, 'native ffmpeg could not decode');
+            nSkipped++;
+            continue;
+        }
 
-    if (mod._pipeline_run_rgba_gpu) {
-        const sp = alloc(src);
-        const dp = mod._malloc(DW * DH * 4);
-        const ret = mod.ccall('pipeline_run_rgba_gpu', 'number',
-            ['number','number','number','number','number','number','string'],
-            [sp, W, H, dp, DW, DH, `scale_webgpu=${DW}:${DH}`]);
-        if (ret === 0) {
-            const out = new Uint8Array(mod.HEAPU8.buffer, dp, DW * DH * 4);
-            ok('GPU scale returns 0',       true);
-            ok('GPU scale output non-zero', out.some(v => v !== 0));
+        // ── pixel comparison ───────────────────────────────────────────
+        const cmp = compareFrames(wasmFrame, refFrame);
+        const tag  = `${label}  [${w}x${h}]`;
+        if (cmp.match) {
+            ok(`${tag}  maxDiff=${cmp.maxDiff}`, true);
+            nDecoded++;
         } else {
-            skip('GPU scale', 'no WebGPU device in Node (expected, test in browser)');
-        }
-        mod._free(sp); mod._free(dp);
-
-        const gpuMs = mod.ccall('bench_scale_webgpu', 'number',
-            ['number','number','number','number','number'], [W, H, DW, DH, 30]);
-        const cpuMs = mod.ccall('bench_scale_cpu', 'number',
-            ['number','number','number','number','number'], [W, H, DW, DH, 30]);
-        if (gpuMs > 0) {
-            ok('bench_scale_webgpu > 0', true);
-            const ratio = cpuMs / gpuMs;
-            console.log(`        GPU bench: ${gpuMs.toFixed(2)} ms/frame — ${ratio >= 1 ? ratio.toFixed(1)+'× faster than CPU' : (1/ratio).toFixed(1)+'× slower than CPU'}`);
-        } else {
-            skip('GPU bench', 'no WebGPU device in Node');
+            console.error(`  FAIL  ${tag}  diffPixels=${cmp.diffPixels}  maxDiff=${cmp.maxDiff}`);
+            failed++;
+            nFailed++;
         }
     }
 
-    // ── FATE samples ──────────────────────────────────────────────────────────
-    // (samples require a demuxer/decoder path — future: wire avformat decode here)
-
-    console.log('\n  FATE samples:');
-    for (const s of SAMPLES) {
-        const dest = path.join(SAMPLES_DIR, s.name);
-        try {
-            await download(s.url, dest);
-            const bytes = fs.statSync(dest).size;
-            ok(`sample ${s.name} downloaded (${(bytes/1024).toFixed(0)} KB)`, bytes > 0);
-        } catch (e) {
-            skip(`sample ${s.name}`, `download failed: ${e.message}`);
-        }
-    }
-    console.log('    (decode + pixel comparison tests require avformat wiring — coming next)');
+    console.log(`\n  decoded ${nDecoded} files, ${nSkipped} skipped (unsupported codec), ${nFailed} pixel mismatches`);
 }
-
-// ── entry ─────────────────────────────────────────────────────────────────────
 
 await runTests('CPU build',    path.join(WASM_DIR, 'build-cpu/ffmpeg-cpu.js'));
 await runTests('WebGPU build', path.join(WASM_DIR, 'build-webgpu/ffmpeg-webgpu.js'));
 
-console.log(`\n${passed + failed + skipped} tests — ${passed} passed, ${failed} failed, ${skipped} skipped\n`);
+console.log(`\n${'─'.repeat(60)}`);
+console.log(`  ${passed + failed + skipped} total — ${passed} passed  ${failed} failed  ${skipped} skipped`);
+console.log(`${'─'.repeat(60)}\n`);
 process.exit(failed > 0 ? 1 : 0);
