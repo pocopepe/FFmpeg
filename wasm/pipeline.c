@@ -445,6 +445,9 @@ int decoder_next_frame(int handle, uint8_t *dst_rgba, int dst_w, int dst_h)
             sws_scale(s->sws,
                       (const uint8_t *const *)s->frame->data, s->frame->linesize,
                       0, s->frame->height, dst_data, dst_stride);
+            /* update reported dims to match actual decoded frame */
+            s->width  = s->frame->width;
+            s->height = s->frame->height;
             av_frame_unref(s->frame);
             return 0;
         }
