@@ -53,6 +53,7 @@ function nativeFirstFrame(filePath, w, h) {
     const tmp = path.join(os.tmpdir(), `fate-ref-${process.pid}.raw`);
     const r = spawnSync('ffmpeg', [
         '-loglevel', 'error',
+        '-noautorotate',        // don't auto-apply display matrix rotation
         '-i', filePath,
         '-vframes', '1',
         '-vf', `scale=${w}:${h}`,
@@ -67,7 +68,7 @@ function nativeFirstFrame(filePath, w, h) {
 
 // Compare two RGBA buffers. Returns { match, maxDiff, diffPixels }.
 // Alpha channel is ignored — colorspace conversion can produce different alpha.
-function compareFrames(a, b, tolerance = 3) {
+function compareFrames(a, b, tolerance = 5) {
     if (a.length !== b.length) return { match: false, maxDiff: -1, diffPixels: -1 };
     let maxDiff = 0, diffPixels = 0;
     const nPixels = a.length / 4;

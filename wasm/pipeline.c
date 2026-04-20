@@ -434,6 +434,16 @@ int decoder_next_frame(int handle, uint8_t *dst_rgba, int dst_w, int dst_h)
                     dst_w, dst_h, AV_PIX_FMT_RGBA,
                     SWS_BILINEAR, NULL, NULL, NULL);
                 if (!s->sws) { av_frame_unref(s->frame); return AVERROR(ENOMEM); }
+                /* propagate color range and matrix so output matches native ffmpeg */
+                {
+                    int src_range = (s->frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+                    enum AVColorSpace cs = (s->frame->colorspace != AVCOL_SPC_UNSPECIFIED)
+                                          ? s->frame->colorspace : AVCOL_SPC_BT709;
+                    const int *cs_tbl = sws_getCoefficients(cs);
+                    /* dst_range=1: RGBA output is always full range (0-255) */
+                    sws_setColorspaceDetails(s->sws, cs_tbl, src_range,
+                                            cs_tbl, 1, 0, 1<<16, 1<<16);
+                }
                 s->sws_src_w   = s->frame->width;
                 s->sws_src_h   = s->frame->height;
                 s->sws_src_fmt = s->frame->format;
