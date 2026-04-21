@@ -415,37 +415,41 @@ int decoder_next_frame(int handle, uint8_t *dst_rgba, int dst_w, int dst_h)
     if (handle < 0 || handle >= MAX_SESSIONS || !g_sessions[handle].active)
         return AVERROR(EINVAL);
     DecodeSession *s = &g_sessions[handle];
-    if (dst_w <= 0) dst_w = s->width;
-    if (dst_h <= 0) dst_h = s->height;
+    /* do NOT resolve 0/0 here — wait for actual frame so mid-stream
+       resolution changes (e.g. VP8) use the real frame dimensions */
 
     for (;;) {
         int ret = avcodec_receive_frame(s->codec_ctx, s->frame);
         if (ret == 0) {
+            /* resolve 0/0 to actual decoded frame dimensions */
+            int out_w = (dst_w > 0) ? dst_w : s->frame->width;
+            int out_h = (dst_h > 0) ? dst_h : s->frame->height;
+
             /* rebuild sws if source or dest params changed */
             if (!s->sws
                 || s->sws_src_w   != s->frame->width
                 || s->sws_src_h   != s->frame->height
                 || s->sws_src_fmt != s->frame->format
-                || s->sws_dst_w   != dst_w
-                || s->sws_dst_h   != dst_h) {
+                || s->sws_dst_w   != out_w
+                || s->sws_dst_h   != out_h) {
                 sws_freeContext(s->sws);
                 s->sws = sws_getContext(
                     s->frame->width, s->frame->height, s->frame->format,
-                    dst_w, dst_h, AV_PIX_FMT_RGBA,
+                    out_w, out_h, AV_PIX_FMT_RGBA,
                     SWS_BILINEAR, NULL, NULL, NULL);
                 if (!s->sws) { av_frame_unref(s->frame); return AVERROR(ENOMEM); }
                 s->sws_src_w   = s->frame->width;
                 s->sws_src_h   = s->frame->height;
                 s->sws_src_fmt = s->frame->format;
-                s->sws_dst_w   = dst_w;
-                s->sws_dst_h   = dst_h;
+                s->sws_dst_w   = out_w;
+                s->sws_dst_h   = out_h;
             }
             uint8_t *dst_data[1]   = { dst_rgba };
-            int      dst_stride[1] = { dst_w * 4 };
+            int      dst_stride[1] = { out_w * 4 };
             sws_scale(s->sws,
                       (const uint8_t *const *)s->frame->data, s->frame->linesize,
                       0, s->frame->height, dst_data, dst_stride);
-            /* update reported dims to match actual decoded frame */
+            /* expose actual decoded frame dims via decoder_width/height */
             s->width  = s->frame->width;
             s->height = s->frame->height;
             av_frame_unref(s->frame);
